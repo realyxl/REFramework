@@ -2,6 +2,9 @@
 
 #include <iostream>
 #include <functional>
+#include <unordered_map>
+#include <mutex>
+#include <wrl/client.h>
 
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi")
@@ -140,7 +143,17 @@ protected:
     static inline std::unique_ptr<PointerHook> s_create_swapchain_hook{};
     static inline void** s_factory_vtable{ nullptr };
     static inline void** s_swapchain_vtable{ nullptr };
-    
+
+public:
+    // NATIVE command-queue capture for Wine/D3DMetal: the command queue is obtained from the
+    // CreateSwapChainForHwnd creation contract (for D3D12, the pDevice parameter IS the
+    // ID3D12CommandQueue) instead of reverse-engineering the swapchain's private memory layout.
+    // Static so it survives the D3D12Hook object resets that hook_d3d12()/rehook performs.
+    static inline std::unordered_map<IDXGISwapChain*, Microsoft::WRL::ComPtr<ID3D12CommandQueue>> s_swapchain_queues{};
+    static inline std::mutex s_swapchain_queues_mtx{};
+    static inline ID3D12CommandQueue* s_last_cmd_queue{ nullptr };
+protected:
+
     OnPresentFn m_on_present{ nullptr };
     OnPresentFn m_on_post_present{ nullptr };
     OnResizeBuffersFn m_on_resize_buffers{ nullptr };

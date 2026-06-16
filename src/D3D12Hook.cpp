@@ -20,6 +20,41 @@
 
 static D3D12Hook* g_d3d12_hook = nullptr;
 thread_local bool g_inside_d3d12_hook = false;
+static constexpr auto COMMAND_QUEUE_SCAN_BYTES = 512 * sizeof(void*);
+
+static bool is_wine() {
+    static int cached = -1;
+    if (cached == -1) {
+        auto ntdll = GetModuleHandleA("ntdll.dll");
+        cached = (ntdll && GetProcAddress(ntdll, "wine_get_version") != nullptr) ? 1 : 0;
+    }
+    return cached == 1;
+}
+
+// NATIVE command-queue capture (Wine/D3DMetal). For Direct3D 12, IDXGIFactory2::CreateSwapChainForHwnd's
+// first parameter (pDevice) IS the ID3D12CommandQueue bound to the swapchain for its lifetime
+// (Microsoft DXGI contract). We therefore REMEMBER that queue at creation time, keyed by the returned
+// swapchain, instead of reverse-engineering a byte offset out of the swapchain's opaque memory layout
+// (which is unstable on D3DMetal and produced the 0x28 false positive). This is exactly how
+// ReShade / the Steam overlay / NVIDIA Streamline obtain the queue on D3D12.
+static void associate_swapchain_queue(IDXGISwapChain* sc, IUnknown* p_device) {
+    if (sc == nullptr || p_device == nullptr) {
+        return;
+    }
+
+    // DXGI contract: for D3D12 the pDevice parameter IS the command queue; store that exact pointer.
+    // (Do NOT QueryInterface for it -- a QI tear-off can be a different pointer that submits to the wrong object.)
+    auto queue = reinterpret_cast<ID3D12CommandQueue*>(p_device);
+
+    {
+        std::scoped_lock _{D3D12Hook::s_swapchain_queues_mtx};
+        D3D12Hook::s_swapchain_queues[sc] = queue; // ComPtr AddRef's
+        D3D12Hook::s_last_cmd_queue = queue;
+    }
+
+    spdlog::info("[D3D12Hook] Captured command queue {:x} for swapchain {:x} from CreateSwapChainForHwnd pDevice",
+        (uintptr_t)queue, (uintptr_t)sc);
+}
 
 D3D12Hook::~D3D12Hook() {
     unhook();
@@ -85,6 +120,54 @@ HRESULT WINAPI D3D12Hook::create_swapchain(IDXGIFactory4* factory, IUnknown* dev
     }
 
     const auto result = create_swap_chain_fn(factory, device, hwnd, desc, p_fullscreen_desc, p_restrict_to_output, swap_chain);
+
+    if (result == S_OK) {
+        const auto wine = is_wine();
+
+        // NATIVE (Wine/D3DMetal): capture the command queue straight from the creation contract
+        // on EVERY swapchain creation (pDevice == ID3D12CommandQueue for D3D12). No memory scan,
+        // no byte offset, no refcount heuristic. Keeps the map fresh across recreation (resolution
+        // / DLSS toggles), so present() always reads the correct, live queue.
+        if (wine) {
+            associate_swapchain_queue(*swap_chain, device);
+        }
+
+        // Bootstrap the Present hook ONCE, from the game's first real swapchain vtable.
+        if (s_swapchain_vtable == nullptr) {
+            spdlog::info("D3D12Hook: Bootstrapping hooks from the game's real swapchain");
+
+            s_factory_vtable = *(void***)factory;
+            s_swapchain_vtable = *(void***)*swap_chain;
+
+            if (wine) {
+                // Command queue already captured above; just install the Present hook.
+                g_d3d12_hook->hook_impl();
+            } else {
+                // Windows/Proton: keep the proven byte-offset discovery for the non-Wine path.
+                for (auto i = 0; i < COMMAND_QUEUE_SCAN_BYTES; i += sizeof(void*)) {
+                    const auto base = (uintptr_t)*swap_chain + i;
+
+                    if (IsBadReadPtr((void*)base, sizeof(void*))) {
+                        break;
+                    }
+
+                    auto data = *(IUnknown**)base;
+
+                    if (data == device) {
+                        s_command_queue_offset = i;
+                        spdlog::info("Found command queue offset: {:x}", i);
+                        break;
+                    }
+                }
+
+                if (s_command_queue_offset == 0) {
+                    spdlog::error("Failed to find command queue offset on real swapchain!");
+                } else {
+                    g_d3d12_hook->hook_impl();
+                }
+            }
+        }
+    }
 
     // rather than waiting on the hook monitor to notice the hook isn't working
     if (!hook_was_nullptr) {
@@ -160,7 +243,10 @@ bool D3D12Hook::hook() {
         g_inside_d3d12_hook = false;
     }};
 
-    if (s_command_queue_offset != 0 && s_swapchain_vtable != nullptr && s_factory_vtable != nullptr) {
+    // NOTE: gate on the swapchain vtable only. On Wine/D3DMetal the command queue is captured
+    // from the creation contract (not an offset), so s_command_queue_offset stays 0 there; requiring
+    // it would prevent the Present hook from being reinstalled after a rehook/reset.
+    if (s_swapchain_vtable != nullptr && s_factory_vtable != nullptr) {
         spdlog::info("Reinitializing D3D12Hook via known pointers");
 
         try {
@@ -173,6 +259,49 @@ bool D3D12Hook::hook() {
         return m_hooked;
     }
 
+    // Load dxgi.dll + the CreateDXGIFactory export (both paths need a DXGI factory).
+    // Manually, because the user may be running Windows 7.
+    const auto dxgi_module = LoadLibraryA("dxgi.dll");
+    if (dxgi_module == nullptr) {
+        spdlog::error("Failed to load dxgi.dll");
+        return false;
+    }
+
+    auto create_dxgi_factory = (decltype(CreateDXGIFactory)*)GetProcAddress(dxgi_module, "CreateDXGIFactory");
+
+    if (create_dxgi_factory == nullptr) {
+        spdlog::error("Failed to get CreateDXGIFactory export");
+        return false;
+    }
+
+    // Wine/D3DMetal (Apple GPTK): we only need the factory's vtable to hook CreateSwapChainForHwnd.
+    // create_swapchain() then bootstraps Present from the game's first real swapchain and takes the
+    // command queue from its pDevice. The dummy device/queue/swapchain the Windows path builds are
+    // unneeded here -- and the dummy swapchain deadlocks in winemac.drv (CAMetalLayer creation blocks
+    // on Cocoa's main thread under win_data_mutex from our non-pumping hook thread; cf. Wine MR !9675).
+    if (is_wine()) {
+        spdlog::info("Wine/D3DMetal: hooking factory CreateSwapChainForHwnd; Present bootstraps on the game's first real swapchain");
+
+        IDXGIFactory4* factory{ nullptr };
+        if (FAILED(create_dxgi_factory(IID_PPV_ARGS(&factory)))) {
+            spdlog::error("Wine: Failed to create DXGI factory");
+            return false;
+        }
+
+        s_factory_vtable = *(void***)factory;
+
+        if (s_create_swapchain_hook == nullptr) {
+            auto& create_swapchain_fn = s_factory_vtable[15]; // CreateSwapChainForHwnd
+            s_create_swapchain_hook = std::make_unique<PointerHook>(&create_swapchain_fn, &D3D12Hook::create_swapchain);
+        }
+
+        m_hooked = true;
+        factory->Release();
+        return true;
+    }
+
+    // --- Windows/Proton: build a dummy device + swapchain to discover the Present vtable and the
+    // --- command-queue byte offset inside the swapchain. ---
     IDXGISwapChain1* swap_chain1{ nullptr };
     IDXGISwapChain3* swap_chain{ nullptr };
     ID3D12Device* device{ nullptr };
@@ -191,7 +320,7 @@ bool D3D12Hook::hook() {
     swap_chain_desc1.Width = 1;
     swap_chain_desc1.Height = 1;
 
-    // Manually get D3D12CreateDevice export because the user may be running Windows 7
+    // Manually get D3D12CreateDevice export
     const auto d3d12_module = LoadLibraryA("d3d12.dll");
     if (d3d12_module == nullptr) {
         spdlog::error("Failed to load d3d12.dll");
@@ -206,12 +335,10 @@ bool D3D12Hook::hook() {
 
     spdlog::info("Creating dummy device");
 
-    // Get the original on-disk bytes of the D3D12CreateDevice export
+    // Get the original on-disk bytes of D3D12CreateDevice so we can temporarily unhook it (compat
+    // with ReShade / other overlays that hook it) -- this is just a throwaway dummy device.
     const auto original_bytes = utility::get_original_bytes(d3d12_create_device);
 
-    // Temporarily unhook D3D12CreateDevice
-    // it allows compatibility with ReShade and other overlays that hook it
-    // this is just a dummy device anyways, we don't want the other overlays to be able to use it
     if (original_bytes) {
         spdlog::info("D3D12CreateDevice appears to be hooked, temporarily unhooking");
 
@@ -220,7 +347,7 @@ bool D3D12Hook::hook() {
 
         ProtectionOverride protection_override{ d3d12_create_device, original_bytes->size(), PAGE_EXECUTE_READWRITE };
         memcpy(d3d12_create_device, original_bytes->data(), original_bytes->size());
-        
+
         if (FAILED(d3d12_create_device(nullptr, feature_level, IID_PPV_ARGS(&device)))) {
             spdlog::error("Failed to create D3D12 Dummy device");
             memcpy(d3d12_create_device, hooked_bytes.data(), hooked_bytes.size());
@@ -237,20 +364,6 @@ bool D3D12Hook::hook() {
     }
 
     spdlog::info("Dummy device: {:x}", (uintptr_t)device);
-
-    // Manually get CreateDXGIFactory export because the user may be running Windows 7
-    const auto dxgi_module = LoadLibraryA("dxgi.dll");
-    if (dxgi_module == nullptr) {
-        spdlog::error("Failed to load dxgi.dll");
-        return false;
-    }
-
-    auto create_dxgi_factory = (decltype(CreateDXGIFactory)*)GetProcAddress(dxgi_module, "CreateDXGIFactory");
-
-    if (create_dxgi_factory == nullptr) {
-        spdlog::error("Failed to get CreateDXGIFactory export");
-        return false;
-    }
 
     spdlog::info("Creating dummy DXGI factory");
 
@@ -400,8 +513,8 @@ bool D3D12Hook::hook() {
 
     s_command_queue_offset = 0;
 
-    // Find the command queue offset in the swapchain
-    for (auto i = 0; i < 512 * sizeof(void*); i += sizeof(void*)) {
+    // Find the command queue offset in the swapchain (direct pointer comparison only)
+    for (auto i = 0; i < COMMAND_QUEUE_SCAN_BYTES; i += sizeof(void*)) {
         const auto base = (uintptr_t)swap_chain1 + i;
 
         // reached the end
@@ -425,7 +538,7 @@ bool D3D12Hook::hook() {
     if (s_command_queue_offset == 0) {
         bool should_break = false;
 
-        for (auto base = 0; base < 512 * sizeof(void*); base += sizeof(void*)) {
+        for (auto base = 0; base < COMMAND_QUEUE_SCAN_BYTES; base += sizeof(void*)) {
             const auto pre_scan_base = (uintptr_t)swap_chain1 + base;
 
             // reached the end
@@ -439,7 +552,7 @@ bool D3D12Hook::hook() {
                 continue;
             }
 
-            for (auto i = 0; i < 512 * sizeof(void*); i += sizeof(void*)) {
+            for (auto i = 0; i < COMMAND_QUEUE_SCAN_BYTES; i += sizeof(void*)) {
                 const auto pre_data = scan_base + i;
 
                 if (IsBadReadPtr((void*)pre_data, sizeof(void*))) {
@@ -618,7 +731,16 @@ HRESULT WINAPI D3D12Hook::present(IDXGISwapChain3* swap_chain, uint64_t sync_int
         d3d12->m_device = temp_device.Get();
     }
 
-    if (d3d12->m_using_proton_swapchain) {
+    if (is_wine()) {
+        // NATIVE: queue captured from the creation contract, keyed by the presenting swapchain.
+        // Fall back to the most-recently-created queue (RE9 has a single primary swapchain), which
+        // also covers the case where a wrapper presents on a different pointer than was created.
+        std::scoped_lock _{D3D12Hook::s_swapchain_queues_mtx};
+        auto it = D3D12Hook::s_swapchain_queues.find((IDXGISwapChain*)swap_chain);
+        d3d12->m_command_queue = (it != D3D12Hook::s_swapchain_queues.end())
+            ? it->second.Get()
+            : D3D12Hook::s_last_cmd_queue;
+    } else if (d3d12->m_using_proton_swapchain) {
         const auto real_swapchain = *(uintptr_t*)((uintptr_t)swap_chain + d3d12->s_proton_swapchain_offset);
         d3d12->m_command_queue = *(ID3D12CommandQueue**)(real_swapchain + d3d12->s_command_queue_offset);
     } else {
