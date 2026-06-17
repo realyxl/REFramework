@@ -26,9 +26,11 @@ at startup.
 
 ## Tested
 
+![In-game screenshot](demo.png)
+
 - MacBook Pro 14" (M3 Pro)
 - macOS Tahoe 27 beta 1
-- CrossOver Preview 20260511 (27.0.0.40479)
+- CrossOver Preview 20260616 (27.0.0.40643)
 - Apple GPTK 4 (D3DMetal 4.0 beta1)
 - Resident Evil Requiem (Steam AppID 3764200, buildid 22898177)
 - Tested at commit `43bd68a6470e7cb7e3dc630dd88be6a8a28c97d7` (this fork, branch `d3dmetal-wine-support`)
@@ -55,10 +57,10 @@ A Windows 11 **ARM** guest, e.g. in VMware Fusion.
 
 Output: `build/bin/REFramework/dinput8.dll`.
 
-## Known limitation
+## ⚠️ Known limitation — IMPORTANT
 
-The overlay needs DLSS frame generation enabled while it loads at startup; you can
-turn it off again afterwards.
+The overlay **requires DLSS frame generation to be enabled** while it loads at
+startup; you can turn it off again afterwards.
 
 ## Credits
 
