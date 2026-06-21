@@ -3,7 +3,7 @@
 A fork of [praydog/REFramework](https://github.com/praydog/REFramework) adding a
 Wine / Apple Game Porting Toolkit (D3DMetal) code path so RE Engine mods can load
 on macOS. Work in progress. The Wine path is gated on `is_wine()`; the
-Windows / Proton path is unchanged.
+Windows / Proton path is unchanged. Worked on both GPTK3 and GPTK4.
 
 ## Use
 
