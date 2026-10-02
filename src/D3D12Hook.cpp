@@ -56,6 +56,44 @@ static void associate_swapchain_queue(IDXGISwapChain* sc, IUnknown* p_device) {
         (uintptr_t)queue, (uintptr_t)sc);
 }
 
+// [D3DMetal/Wine] See D3D12Hook.hpp. Static-only: no D3D12Hook instance is
+// created, so nothing here can be torn down by a later hook_d3d12().
+bool D3D12Hook::early_hook_wine_factory() {
+    if (!is_wine()) {
+        return false;
+    }
+
+    const auto dxgi_module = LoadLibraryA("dxgi.dll");
+    if (dxgi_module == nullptr) {
+        spdlog::error("Failed to load dxgi.dll");
+        return false;
+    }
+
+    auto create_dxgi_factory = (decltype(CreateDXGIFactory)*)GetProcAddress(dxgi_module, "CreateDXGIFactory");
+    if (create_dxgi_factory == nullptr) {
+        spdlog::error("Failed to get CreateDXGIFactory export");
+        return false;
+    }
+
+    spdlog::info("Wine/D3DMetal: installing early factory hook (before the game creates its initial swapchain)");
+
+    IDXGIFactory4* factory{ nullptr };
+    if (FAILED(create_dxgi_factory(IID_PPV_ARGS(&factory)))) {
+        spdlog::error("Wine: Failed to create DXGI factory");
+        return false;
+    }
+
+    s_factory_vtable = *(void***)factory;
+
+    if (s_create_swapchain_hook == nullptr) {
+        auto& create_swapchain_fn = s_factory_vtable[15]; // CreateSwapChainForHwnd
+        s_create_swapchain_hook = std::make_unique<PointerHook>(&create_swapchain_fn, &D3D12Hook::create_swapchain);
+    }
+
+    factory->Release();
+    return true;
+}
+
 D3D12Hook::~D3D12Hook() {
     unhook();
 }
@@ -106,8 +144,24 @@ HRESULT WINAPI D3D12Hook::create_swapchain(IDXGIFactory4* factory, IUnknown* dev
 
     spdlog::info("create_swapchain called");
 
-    while (g_framework == nullptr) {
-        std::this_thread::yield();
+    // [D3DMetal/Wine] Pre-framework: REFramework's constructor may still be
+    // running (early factory hook installed right after d3d12.dll load).
+    // Waiting for g_framework here would deadlock the game's startup thread
+    // (the constructor is itself waiting on render frames), so instead we pass
+    // through, record the swapchain/factory vtables and the command queue, and
+    // let the later hook_d3d12() bootstrap Present via the "known pointers"
+    // path. No locks are taken on this path.
+    if (g_framework == nullptr) {
+        const auto early_result = create_swap_chain_fn(factory, device, hwnd, desc, p_fullscreen_desc, p_restrict_to_output, swap_chain);
+
+        if (early_result == S_OK && swap_chain != nullptr && *swap_chain != nullptr) {
+            s_factory_vtable = *(void***)factory;
+            s_swapchain_vtable = *(void***)*swap_chain;
+            associate_swapchain_queue(*swap_chain, device);
+            spdlog::info("D3D12Hook: Recorded game swapchain pre-framework (vtable {:x})", (uintptr_t)s_swapchain_vtable);
+        }
+
+        return early_result;
     }
 
     std::scoped_lock _{g_framework->get_hook_monitor_mutex()};

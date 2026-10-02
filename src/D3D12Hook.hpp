@@ -30,6 +30,15 @@ public:
 	bool hook();
 	bool unhook();
 
+	// [D3DMetal/Wine] Installs ONLY the static IDXGIFactory2::CreateSwapChainForHwnd
+	// vtable hook, as early as possible (before the game creates its initial
+	// swapchain). Must NOT create a D3D12Hook instance: hook_d3d12() (frame-1)
+	// would destroy it while g_framework is still null, and ~D3D12Hook ->
+	// unhook() waits on g_framework => init-thread deadlock. create_swapchain()
+	// records the swapchain/factory vtables pre-framework; the frame-1
+	// hook_d3d12() then bootstraps Present via the "known pointers" path.
+	static bool early_hook_wine_factory();
+
     bool is_hooked() {
         return m_hooked;
     }
