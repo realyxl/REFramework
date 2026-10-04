@@ -1,5 +1,12 @@
 # REFramework — Wine / macOS (Apple GPTK / D3DMetal)  ⚠️ WIP
 
+| Branch | Release | Status | Latest version |
+|---|---|---|---|
+| [`d3dmetal-wine-support`](../../tree/d3dmetal-wine-support) | stable | tested | [`v0.1_beta`](../../releases/tag/v0.1_beta) |
+| [`staging`](../../tree/staging) | pre-release | untested | [`v0.2_beta`](../../releases/tag/v0.2_beta) |
+
+This README describes the stable branch; see the [changes in `staging`](../../compare/d3dmetal-wine-support...staging).
+
 A fork of [praydog/REFramework](https://github.com/praydog/REFramework) adding a
 Wine / Apple Game Porting Toolkit (D3DMetal) code path so RE Engine mods can load
 on macOS. Work in progress. The Wine path is gated on `is_wine()`; the
