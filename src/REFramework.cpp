@@ -472,6 +472,17 @@ REFramework::REFramework(HMODULE reframework_module)
         }
 
         spdlog::info("D3D12 loaded");
+
+        // [D3DMetal/Wine] Install the DXGI factory hook NOW, before the game
+        // creates its initial swapchain. MHRISE creates its swapchain during
+        // engine startup, BEFORE the first RenderFrame, so the factory hook
+        // installed later (after frame 1) never sees it -> no overlay.
+        // IMPORTANT: do NOT call the full hook_d3d12() here. The D3D12Hook
+        // instance it creates would be destroyed by the frame-1 hook_d3d12()
+        // while g_framework is still null (we are inside the constructor),
+        // and ~D3D12Hook -> unhook() spins on g_framework forever -> deadlock.
+        // The static-only factory hook has no such lifecycle.
+        D3D12Hook::early_hook_wine_factory();
     }
 
     if (gi.is_mhrise() || gi.is_dd2() || gi.tdb_ver() >= 74) {

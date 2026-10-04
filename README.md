@@ -1,5 +1,4 @@
-# REFramework — Wine / macOS (Apple GPTK / D3DMetal)  ⚠️ WIP
-
+# REFramework — Wine / macOS (Apple GPTK / D3DMetal)  
 A fork of [praydog/REFramework](https://github.com/praydog/REFramework) adding a
 Wine / Apple Game Porting Toolkit (D3DMetal) code path so RE Engine mods can load
 on macOS. Work in progress. The Wine path is gated on `is_wine()`; the
@@ -56,11 +55,6 @@ A Windows 11 **ARM** guest, e.g. in VMware Fusion.
    ```
 
 Output: `build/bin/REFramework/dinput8.dll`.
-
-## ⚠️ Known limitation — IMPORTANT
-
-The overlay **requires DLSS frame generation to be enabled** while it loads at
-startup; you can turn it off again afterwards.
 
 ## Credits
 
